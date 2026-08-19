@@ -62,7 +62,7 @@ fn augment_system_prompt_with_file_tools(system_prompt: &str, is_agent_mode: boo
     format!(
         "{system_prompt}\n\n[DBX FILE EVIDENCE TOOLS]\n\
 Read-only file evidence tools are available in this run. When the user supplies an absolute directory path, call dbx_file_open_scope first, then use dbx_file_list/dbx_file_search/dbx_file_read/dbx_file_parse as needed. For a directory whose final name is db-wiki, prefer dbx_wiki_search/dbx_wiki_build_evidence. Do not claim that local files are inaccessible before attempting these tools. If no absolute path is present in the conversation, ask for it instead of inventing one. Any canonical directory may be read, but write access is granted only when a registered write allowlist policy matches.\n\
-Treat dbx_file_open_scope as the first file tool of every new user request that needs files, even if an earlier conversation turn opened the same directory; opening the same path again is safe. Never invent or reuse a scopeId from assistant text. Do not call dbx_file_close_scope after completing a task unless the user explicitly asks to close it or the root must be abandoned.\n\
+Treat dbx_file_open_scope as the first file tool of every new user request that needs files, even if an earlier conversation turn opened the same directory; opening the same path again is safe. Never invent or reuse a scopeId from assistant text. If a file tool returns FILE_SCOPE_NOT_FOUND, immediately call dbx_file_open_scope again using the exact absolute directory path supplied in the current user request or selected Prompt template, then retry the failed file action once with the new scopeId. Do not continue the task or report the first failure as final. If no such path is available, ask the user for it. Do not call dbx_file_close_scope after completing a task unless the user explicitly asks to close it or the root must be abandoned.\n\
 {write_rule}"
     )
 }
@@ -1221,11 +1221,15 @@ async fn maybe_compact(
 
 fn tool_result_for_followup_context(tool_name: &str, content: &str) -> String {
     let result = compact_tool_result_for_context(tool_name, content);
+    let scope_recovery = content.contains("FILE_SCOPE_NOT_FOUND").then_some(
+        "\n\n[MANDATORY FILE-SCOPE RECOVERY]\nThe scope ID is no longer valid. Before any other work, call dbx_file_open_scope with the exact absolute directory path from the current user request or selected Prompt template. Use the returned scopeId to retry the failed action once. Never reuse the failed scopeId. If the path is unavailable, ask the user for it.",
+    );
     format!(
         "[TOOL RESULT - INTERMEDIATE EVIDENCE]\n\
 Tool: {tool_name}\n\
 Use this result to continue the original user task. Do not summarize this tool result as the final answer unless the user explicitly asked for a tool-result or schema summary.\n\n\
-{result}"
+{result}{}",
+        scope_recovery.unwrap_or_default(),
     )
 }
 
@@ -1469,6 +1473,8 @@ mod tests {
             assert!(prompt.contains("Do not claim that local files are inaccessible before attempting these tools"));
             assert!(prompt.contains("first file tool of every new user request"));
             assert!(prompt.contains("Never invent or reuse a scopeId"));
+            assert!(prompt.contains("FILE_SCOPE_NOT_FOUND"));
+            assert!(prompt.contains("retry the failed file action once"));
         }
     }
 
@@ -1573,6 +1579,19 @@ mod tests {
         assert!(wrapped.contains("INTERMEDIATE EVIDENCE"));
         assert!(wrapped.contains("continue the original user task"));
         assert!(wrapped.contains("Columns of tb_customer"));
+    }
+
+    #[test]
+    fn requires_scope_recovery_after_a_stale_file_scope_error() {
+        let wrapped = tool_result_for_followup_context(
+            "dbx_file_read",
+            "Error: FILE_SCOPE_NOT_FOUND: scope is closed or the application restarted",
+        );
+
+        assert!(wrapped.contains("MANDATORY FILE-SCOPE RECOVERY"));
+        assert!(wrapped.contains("dbx_file_open_scope"));
+        assert!(wrapped.contains("retry the failed action once"));
+        assert!(wrapped.contains("Never reuse the failed scopeId"));
     }
 
     // --- chunk_to_events tests ---
