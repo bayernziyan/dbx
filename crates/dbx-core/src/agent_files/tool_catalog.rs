@@ -2,8 +2,8 @@ use serde_json::{json, Value};
 
 use crate::agent_events::ToolDefinition;
 
-pub fn definitions() -> Vec<ToolDefinition> {
-    vec![
+pub fn definitions(local_edit_enabled: bool, local_remove_enabled: bool) -> Vec<ToolDefinition> {
+    let mut definitions = vec![
         tool(
             "dbx_file_open_scope",
             "Open a read scope from an absolute directory path explicitly present in the user prompt. Any canonical directory can be read; write access is granted only when a registered write allowlist policy matches (V1: final directory name db-wiki).",
@@ -95,26 +95,58 @@ pub fn definitions() -> Vec<ToolDefinition> {
             false,
             false,
         ),
-    ]
+    ];
+    if local_edit_enabled {
+        let write_index =
+            definitions.iter().position(|definition| definition.name == "dbx_file_write").unwrap_or(definitions.len());
+        let mut edit = super::local_edit::contract::definition();
+        if local_remove_enabled {
+            edit.description = "Edit content inside an existing allowlisted UTF-8 text file with exact, unique old_text anchors. The edit operation named delete removes only matched text; it never removes the file itself. Use dbx_file_delete to remove a whole file. Call dbx_file_stat for the raw-byte expected_hash before editing.";
+        }
+        definitions.insert(write_index, edit);
+    }
+    if local_remove_enabled {
+        for definition in &mut definitions {
+            if definition.name == "dbx_file_list" {
+                definition.description = "List files and subdirectories inside an open scope using a normalized relative path and bounded depth (0..10). Use this existing traversal tool to inspect a directory before dbx_directory_delete; it never mutates or recursively deletes entries.";
+            } else if definition.name == "dbx_file_stat" {
+                definition.description = "Return metadata and the raw-byte SHA-256 contentHash for a file inside an open scope. Use this hash as expected_hash before dbx_file_edit or dbx_file_delete; stat never mutates the target.";
+            } else if definition.name == "dbx_file_write" {
+                definition.description = "Create or update an allowlisted UTF-8 text file inside a read-write scope; it never deletes a file. Existing files require expected_hash and new files require expected_missing=true. Missing parent directories may be created as part of writing the file; use dbx_directory_create only when an empty directory is itself required.";
+            } else if definition.name == "dbx_wiki_update_from_session" {
+                definition.description = "Create or update session-derived knowledge in a db-wiki text file using the same hash guards as dbx_file_write; it never deletes files. Use dbx_file_delete only when the user explicitly requests whole-file removal.";
+            } else if definition.name == "dbx_wiki_sync_manifest" {
+                definition.description = "Regenerate .dbx-wiki/manifest.json for a db-wiki scope. File write, edit, delete, and restore already coordinate the Manifest; call this tool only to repair independent drift or an explicitly reported unknown Manifest status.";
+            }
+        }
+        let write_index = definitions
+            .iter()
+            .position(|definition| definition.name == "dbx_file_write")
+            .map_or(definitions.len(), |index| index + 1);
+        definitions.splice(write_index..write_index, super::local_remove::contract::definitions());
+    }
+    definitions
 }
 
-pub fn handles(name: &str) -> bool {
-    matches!(
-        name,
-        "dbx_file_open_scope"
-            | "dbx_file_close_scope"
-            | "dbx_file_list"
-            | "dbx_file_search"
-            | "dbx_file_read"
-            | "dbx_file_parse"
-            | "dbx_file_stat"
-            | "dbx_file_write"
-            | "dbx_wiki_status"
-            | "dbx_wiki_search"
-            | "dbx_wiki_build_evidence"
-            | "dbx_wiki_sync_manifest"
-            | "dbx_wiki_update_from_session"
-    )
+pub fn handles(name: &str, local_edit_enabled: bool, local_remove_enabled: bool) -> bool {
+    (local_edit_enabled && name == super::local_edit::contract::TOOL_NAME)
+        || (local_remove_enabled && super::local_remove::contract::handles(name))
+        || matches!(
+            name,
+            "dbx_file_open_scope"
+                | "dbx_file_close_scope"
+                | "dbx_file_list"
+                | "dbx_file_search"
+                | "dbx_file_read"
+                | "dbx_file_parse"
+                | "dbx_file_stat"
+                | "dbx_file_write"
+                | "dbx_wiki_status"
+                | "dbx_wiki_search"
+                | "dbx_wiki_build_evidence"
+                | "dbx_wiki_sync_manifest"
+                | "dbx_wiki_update_from_session"
+        )
 }
 
 fn tool(

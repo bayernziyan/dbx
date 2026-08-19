@@ -75,7 +75,7 @@ pub fn bytes_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
+pub(super) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("FILE_WRITE_FAILED: target has no parent")?;
     let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("file");
     let temp = parent.join(format!(".{name}.{}.tmp", &uuid::Uuid::new_v4().simple().to_string()[..8]));
@@ -93,7 +93,7 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
     result
 }
 
-fn validate_text_format(extension: &str, content: &str) -> Result<(), String> {
+pub(super) fn validate_text_format(extension: &str, content: &str) -> Result<(), String> {
     match extension.to_ascii_lowercase().as_str() {
         "json" => serde_json::from_str::<serde_json::Value>(content)
             .map(|_| ())

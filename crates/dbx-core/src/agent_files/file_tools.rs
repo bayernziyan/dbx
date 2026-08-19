@@ -19,22 +19,58 @@ use super::file_support::{
 use super::file_write::{bytes_sha256, file_sha256, write_text_file, WriteRequest};
 use super::policy_registry::PolicyRegistry;
 
-#[derive(Default)]
 pub struct AgentFileService {
     policies: PolicyRegistry,
     scopes: RwLock<HashMap<String, FileDirectoryScope>>,
+    local_edit_enabled: bool,
+    local_remove_enabled: bool,
+}
+
+impl Default for AgentFileService {
+    fn default() -> Self {
+        Self::with_features(
+            super::local_edit::feature_gate::enabled_from_env(),
+            super::local_remove::feature_gate::enabled_from_env(),
+        )
+    }
 }
 
 impl AgentFileService {
+    #[cfg(test)]
+    pub(crate) fn with_local_edit_enabled(local_edit_enabled: bool) -> Self {
+        Self::with_features(local_edit_enabled, false)
+    }
+
+    pub(crate) fn with_features(local_edit_enabled: bool, local_remove_enabled: bool) -> Self {
+        Self {
+            policies: PolicyRegistry::default(),
+            scopes: RwLock::new(HashMap::new()),
+            local_edit_enabled,
+            local_remove_enabled,
+        }
+    }
+
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        super::tool_catalog::definitions()
+        super::tool_catalog::definitions(self.local_edit_enabled, self.local_remove_enabled)
     }
 
     pub fn handles(&self, name: &str) -> bool {
-        super::tool_catalog::handles(name)
+        super::tool_catalog::handles(name, self.local_edit_enabled, self.local_remove_enabled)
     }
 
     pub async fn execute(&self, call: &ToolCall) -> ToolResult {
+        if call.name == super::local_edit::contract::TOOL_NAME && self.local_edit_enabled {
+            return match self.scope(&call.arguments).await {
+                Ok(scope) => super::local_edit::execute(call, &scope).await,
+                Err(error) => super::local_edit::scope_error_result(call, error),
+            };
+        }
+        if super::local_remove::contract::handles(&call.name) && self.local_remove_enabled {
+            return match self.scope(&call.arguments).await {
+                Ok(scope) => super::local_remove::execute(call, &scope).await,
+                Err(error) => super::local_remove::scope_error_result(call, error),
+            };
+        }
         let result = match call.name.as_str() {
             "dbx_file_open_scope" => self.open_scope(&call.arguments).await,
             "dbx_file_close_scope" => self.close_scope(&call.arguments).await,
