@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use futures::future::join_all;
 use futures::FutureExt;
@@ -34,6 +34,38 @@ const TOOL_RESULT_HEAD_CHARS: usize = 4_000;
 const TOOL_RESULT_TAIL_CHARS: usize = 4_000;
 const TOOL_RESULT_SAMPLE_ITEMS: usize = 5;
 const MAX_CONTRACT_REPAIR_ATTEMPTS: u32 = 2;
+
+fn agent_file_tools_enabled() -> bool {
+    !std::env::var("DBX_AGENT_FILE_TOOLS")
+        .ok()
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+}
+
+fn shared_agent_function_registry() -> Arc<crate::agent_files::AgentFunctionRegistry> {
+    static REGISTRY: OnceLock<Arc<crate::agent_files::AgentFunctionRegistry>> = OnceLock::new();
+    Arc::clone(REGISTRY.get_or_init(|| Arc::new(crate::agent_files::AgentFunctionRegistry::default())))
+}
+
+fn extension_definitions_for_mode(
+    registry: &crate::agent_files::AgentFunctionRegistry,
+    is_agent_mode: bool,
+) -> Vec<ToolDefinition> {
+    registry.definitions().into_iter().filter(|definition| is_agent_mode || definition.read_only).collect()
+}
+
+fn augment_system_prompt_with_file_tools(system_prompt: &str, is_agent_mode: bool) -> String {
+    let write_rule = if is_agent_mode {
+        "File writes are available only inside the opened allowlisted scope and must use the supplied hash guards."
+    } else {
+        "This is Ask mode: use only the read-only file and Wiki tools; file writes and Wiki updates are unavailable."
+    };
+    format!(
+        "{system_prompt}\n\n[DBX FILE EVIDENCE TOOLS]\n\
+Read-only file evidence tools are available in this run. When the user supplies an absolute directory path, call dbx_file_open_scope first, then use dbx_file_list/dbx_file_search/dbx_file_read/dbx_file_parse as needed. For a directory whose final name is db-wiki, prefer dbx_wiki_search/dbx_wiki_build_evidence. Do not claim that local files are inaccessible before attempting these tools. If no absolute path is present in the conversation, ask for it instead of inventing one. Any canonical directory may be read, but write access is granted only when a registered write allowlist policy matches.\n\
+Treat dbx_file_open_scope as the first file tool of every new user request that needs files, even if an earlier conversation turn opened the same directory; opening the same path again is safe. Never invent or reuse a scopeId from assistant text. Do not call dbx_file_close_scope after completing a task unless the user explicitly asks to close it or the root must be abandoned.\n\
+{write_rule}"
+    )
+}
 
 fn take_text(m: &std::sync::Mutex<String>) -> String {
     m.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -242,11 +274,22 @@ pub async fn run_agent_loop(
         )
         .await;
     }
-    let tools = if is_agent_mode {
+    let function_extensions = shared_agent_function_registry();
+    let file_tools_enabled = agent_file_tools_enabled();
+    let file_tools_system_prompt = if file_tools_enabled {
+        augment_system_prompt_with_file_tools(system_prompt, is_agent_mode)
+    } else {
+        system_prompt.to_string()
+    };
+    let system_prompt = file_tools_system_prompt.as_str();
+    let mut tools = if is_agent_mode {
         agent_tools::all_tools(agent_ctx.db_type, agent_ctx.sql_permissions.clone())
     } else {
         agent_tools::read_only_tools(agent_ctx.db_type)
     };
+    if file_tools_enabled {
+        tools.extend(extension_definitions_for_mode(&function_extensions, is_agent_mode));
+    }
     let task_contract = task_contract.cloned();
     let mut conversation_messages: Vec<AiMessage> = messages.to_vec();
     let mut final_text = String::new();
@@ -478,6 +521,7 @@ pub async fn run_agent_loop(
         let schema2 = agent_ctx.schema.clone();
         let db_type = agent_ctx.db_type;
         let sql_permissions = agent_ctx.sql_permissions.clone();
+        let function_extensions2 = Arc::clone(&function_extensions);
 
         // Split by index into parallel and sequential groups using tool metadata
         let tool_parallel_map: std::collections::HashMap<&str, bool> =
@@ -493,28 +537,34 @@ pub async fn run_agent_loop(
         };
 
         // Run parallel group
-        let parallel_futures: Vec<_> =
-            parallel_indices
-                .iter()
-                .map(|&i| {
-                    let tc = make_tc(&collected_tool_calls[i]);
-                    let state = Arc::clone(&state2);
-                    let conn = conn2.clone();
-                    let db = db2.clone();
-                    let schema = schema2.clone();
-                    let perms = sql_permissions.clone();
-                    async move {
+        let parallel_futures: Vec<_> = parallel_indices
+            .iter()
+            .map(|&i| {
+                let tc = make_tc(&collected_tool_calls[i]);
+                let state = Arc::clone(&state2);
+                let conn = conn2.clone();
+                let db = db2.clone();
+                let schema = schema2.clone();
+                let perms = sql_permissions.clone();
+                let extensions = Arc::clone(&function_extensions2);
+                async move {
+                    if extensions.handles(&tc.name) {
+                        extensions.execute(&tc).await.expect("handled extension tool must execute")
+                    } else {
                         agent_tools::execute_tool(&tc, &state, &conn, &db, schema.as_deref(), &db_type, perms).await
                     }
-                })
-                .collect();
+                }
+            })
+            .collect();
         let parallel_results = join_all(parallel_futures).await;
 
         // Run sequential group one-by-one
         let mut sequential_results = Vec::with_capacity(sequential_indices.len());
         for &i in &sequential_indices {
             let tc = make_tc(&collected_tool_calls[i]);
-            sequential_results.push(
+            sequential_results.push(if function_extensions2.handles(&tc.name) {
+                function_extensions2.execute(&tc).await.expect("handled extension tool must execute")
+            } else {
                 agent_tools::execute_tool(
                     &tc,
                     &state2,
@@ -524,8 +574,8 @@ pub async fn run_agent_loop(
                     &db_type,
                     sql_permissions.clone(),
                 )
-                .await,
-            );
+                .await
+            });
         }
 
         // Merge results back into original order
@@ -1382,6 +1432,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(effective_context_window(&config), 65_536);
+    }
+
+    #[test]
+    fn ask_mode_exposes_read_only_file_evidence_tools() {
+        let registry = crate::agent_files::AgentFunctionRegistry::default();
+        let tools = extension_definitions_for_mode(&registry, false);
+        let names = tools.iter().map(|tool| tool.name).collect::<Vec<_>>();
+
+        assert!(names.contains(&"dbx_file_open_scope"));
+        assert!(names.contains(&"dbx_file_read"));
+        assert!(names.contains(&"dbx_wiki_search"));
+        assert!(names.contains(&"dbx_wiki_build_evidence"));
+        assert!(!names.contains(&"dbx_file_write"));
+        assert!(!names.contains(&"dbx_wiki_sync_manifest"));
+        assert!(!names.contains(&"dbx_wiki_update_from_session"));
+        assert!(tools.iter().all(|tool| tool.read_only));
+    }
+
+    #[test]
+    fn agent_mode_exposes_file_read_and_write_tools() {
+        let registry = crate::agent_files::AgentFunctionRegistry::default();
+        let names =
+            extension_definitions_for_mode(&registry, true).into_iter().map(|tool| tool.name).collect::<Vec<_>>();
+
+        assert!(names.contains(&"dbx_file_read"));
+        assert!(names.contains(&"dbx_file_write"));
+        assert!(names.contains(&"dbx_wiki_update_from_session"));
+    }
+
+    #[test]
+    fn file_tool_prompt_requires_wiki_read_attempt_in_both_modes() {
+        for is_agent_mode in [false, true] {
+            let prompt = augment_system_prompt_with_file_tools("base", is_agent_mode);
+            assert!(prompt.contains("call dbx_file_open_scope first"));
+            assert!(prompt.contains("Do not claim that local files are inaccessible before attempting these tools"));
+            assert!(prompt.contains("first file tool of every new user request"));
+            assert!(prompt.contains("Never invent or reuse a scopeId"));
+        }
     }
 
     #[test]

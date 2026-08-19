@@ -4,6 +4,8 @@ pub mod agent_catalog;
 pub mod agent_connection;
 pub mod agent_events;
 pub mod agent_explain;
+pub mod agent_files;
+pub mod agent_knowledge;
 pub mod agent_kv;
 pub mod agent_loop;
 pub mod agent_manager;
@@ -102,6 +104,7 @@ pub mod transfer;
 pub mod two_phase_commit;
 pub mod types;
 pub mod update;
+pub mod wiki;
 pub mod xlsx_export;
 
 pub const R2_CDN_BASE: &str = "https://dl.dbxio.com/";
