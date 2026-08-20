@@ -1,0 +1,6 @@
+/target/
+/dist/
+/config/guard.toml
+/secrets/
+/state/
+/logs/

@@ -1,0 +1,15 @@
+.dbx-guard-viewer [data-dbx-guard-hidden="true"] {
+  display: none !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+@media (max-width: 640px) {
+  .dbx-guard-viewer body,
+  .dbx-guard-viewer #app,
+  .dbx-guard-viewer #app > div {
+    min-width: 0 !important;
+    width: 100vw !important;
+    max-width: 100vw !important;
+  }
+}

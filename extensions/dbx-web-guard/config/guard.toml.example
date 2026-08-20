@@ -1,0 +1,229 @@
+[server]
+listen = "127.0.0.1:4226"
+public_base_path = "/dbx"
+
+[upstream]
+base_url = "http://127.0.0.1:4225"
+credential_file = "../secrets/upstream.dpapi"
+connect_timeout_seconds = 5
+request_timeout_seconds = 3600
+
+[static_files]
+directory = "../../../nginx/dbx"
+index_file = "index.html"
+
+[storage]
+credentials_db = "../state/credentials.db"
+
+[session]
+idle_timeout_minutes = 480
+absolute_timeout_minutes = 1440
+cookie_name = "dbx_guard_session"
+ui_cookie_name = "dbx_guard_ui"
+secure_cookies = false
+
+[security]
+allowed_origins = ["http://127.0.0.1:82"]
+max_body_mib = 128
+login_max_attempts = 5
+login_lockout_seconds = 60
+
+[policy]
+viewer_default_deny = true
+
+[[policy.viewer_deny]]
+path = "/dbx/api/update/"
+methods = ["*"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/changelog"
+exact = true
+methods = ["*"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/cloud-sync/"
+methods = ["*"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/connection/save"
+exact = true
+methods = ["*"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/connection/mcp/"
+methods = ["*"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/agents/"
+methods = ["POST", "PUT", "PATCH", "DELETE"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/jdbc/"
+methods = ["POST", "PUT", "PATCH", "DELETE"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/app-settings/"
+methods = ["POST", "PUT", "PATCH", "DELETE"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/layout/"
+methods = ["POST", "PUT", "PATCH", "DELETE"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/prompt-templates"
+methods = ["POST", "PUT", "PATCH", "DELETE"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/ai/config"
+exact = true
+methods = ["POST", "PUT", "PATCH", "DELETE"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/ai/provider-config"
+exact = true
+methods = ["POST", "PUT", "PATCH", "DELETE"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/ai/configs"
+exact = true
+methods = ["POST", "PUT", "PATCH", "DELETE"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/ai/default-config"
+exact = true
+methods = ["*"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/ai/config-item"
+exact = true
+methods = ["*"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/ai/test-connection"
+exact = true
+methods = ["*"]
+
+[[policy.viewer_deny]]
+path = "/dbx/api/docs/annotations/save"
+exact = true
+methods = ["*"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/connection/"
+methods = ["GET", "POST"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/plugins"
+exact = true
+methods = ["GET"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/system/"
+methods = ["GET"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/agents/"
+methods = ["GET"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/jdbc/"
+methods = ["GET"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/schema/"
+methods = ["GET", "POST"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/dialect/"
+methods = ["GET", "POST"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/query/"
+methods = ["GET", "POST", "DELETE"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/redis/pubsub/ws"
+exact = true
+methods = ["GET"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/docs/"
+methods = ["GET", "POST"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/history"
+methods = ["GET", "POST", "DELETE"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/saved-sql"
+methods = ["GET", "POST", "PUT", "DELETE"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/ai/config"
+exact = true
+methods = ["GET"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/ai/provider-configs"
+exact = true
+methods = ["GET"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/ai/configs"
+exact = true
+methods = ["GET"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/ai/chat-selection"
+exact = true
+methods = ["GET", "POST"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/ai/conversation"
+methods = ["GET", "POST", "DELETE"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/ai/complete"
+exact = true
+methods = ["POST"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/ai/stream"
+exact = true
+methods = ["POST"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/ai/agent-stream"
+exact = true
+methods = ["POST"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/ai/cancel-stream"
+exact = true
+methods = ["POST"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/ai/models"
+exact = true
+methods = ["POST"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/ai/model-effort"
+exact = true
+methods = ["POST"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/prompt-templates"
+methods = ["GET"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/layout/"
+methods = ["GET"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/app-settings/"
+methods = ["GET"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/tab-runtime-cache"
+methods = ["GET", "POST", "DELETE"]
