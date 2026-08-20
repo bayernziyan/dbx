@@ -254,9 +254,25 @@ fn validate_final_text(extension: &str, content: &str) -> Result<(), ContractErr
 }
 
 fn validate_markdown(content: &str) -> Result<(), ContractError> {
-    let fences = content.lines().filter(|line| line.trim_start().starts_with("```")).count();
-    if fences % 2 != 0 {
-        return Err(ContractError::new("FORMAT_MARKDOWN_INVALID", "unbalanced fenced code block"));
+    let mut open_fence: Option<(char, usize, usize)> = None;
+    for (index, line) in content.lines().enumerate() {
+        let Some((marker, length, trailing)) = markdown_fence(line) else {
+            continue;
+        };
+        if let Some((open_marker, open_length, _)) = open_fence {
+            if marker == open_marker && length >= open_length && trailing.trim().is_empty() {
+                open_fence = None;
+            }
+        } else if marker != '`' || !trailing.contains('`') {
+            open_fence = Some((marker, length, index + 1));
+        }
+    }
+    if let Some((marker, length, line)) = open_fence {
+        let delimiter: String = std::iter::repeat_n(marker, length).collect();
+        return Err(ContractError::new(
+            "FORMAT_MARKDOWN_INVALID",
+            format!("fenced code block opened at line {line} with '{delimiter}' is not closed"),
+        ));
     }
     let mut lines = content.lines();
     if lines.next() == Some("---") {
@@ -276,6 +292,52 @@ fn validate_markdown(content: &str) -> Result<(), ContractError> {
             .map_err(|error| ContractError::new("FORMAT_MARKDOWN_INVALID", format!("invalid front matter: {error}")))?;
     }
     Ok(())
+}
+
+fn markdown_fence(line: &str) -> Option<(char, usize, &str)> {
+    let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation > 3 {
+        return None;
+    }
+    let candidate = &line[indentation..];
+    let marker = candidate.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let length = candidate.chars().take_while(|value| *value == marker).count();
+    (length >= 3).then(|| (marker, length, &candidate[length..]))
+}
+
+#[cfg(test)]
+mod markdown_tests {
+    use super::validate_markdown;
+
+    #[test]
+    fn accepts_backtick_tilde_and_nested_literal_fences() {
+        validate_markdown("```sql\nselect 1;\n```\n\n~~~text\nvalue\n~~~\n").unwrap();
+        validate_markdown("````markdown\n```sql\nselect 1;\n```\n````\n").unwrap();
+        validate_markdown("````text\n```\n````\n").unwrap();
+    }
+
+    #[test]
+    fn ignores_fence_markers_indented_as_code() {
+        validate_markdown("    ```\nordinary indented code\n").unwrap();
+    }
+
+    #[test]
+    fn reports_unclosed_fence_with_opening_line() {
+        let error = validate_markdown("heading\n\n~~~sql\nselect 1;\n").unwrap_err();
+        assert_eq!(error.code, "FORMAT_MARKDOWN_INVALID");
+        assert!(error.message.contains("line 3"));
+        assert!(error.message.contains("~~~"));
+    }
+
+    #[test]
+    fn requires_matching_marker_length_and_plain_closing_line() {
+        assert!(validate_markdown("````text\nvalue\n```\n").is_err());
+        assert!(validate_markdown("```text\nvalue\n~~~\n").is_err());
+        assert!(validate_markdown("```text\nvalue\n``` trailing\n").is_err());
+    }
 }
 
 fn mutation_fingerprint(policy_id: &str, relative_path: &str, request: &EditRequest) -> String {

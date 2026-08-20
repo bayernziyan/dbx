@@ -11,6 +11,26 @@
     "lucide-monitor",
     "lucide-palette",
   ];
+  let firstTemplateName = "";
+  let templatesLoaded = false;
+  let templateSelectionBusy = false;
+  let agentSelectionBusy = false;
+
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = async (...args) => {
+    const response = await nativeFetch(...args);
+    try {
+      const request = args[0];
+      const url = new URL(typeof request === "string" ? request : request.url, window.location.href);
+      const method = (args[1]?.method || (typeof request === "object" && request.method) || "GET").toUpperCase();
+      if (viewer() && method === "GET" && url.pathname.endsWith("/api/prompt-templates")) {
+        const templates = await response.clone().json();
+        templatesLoaded = Array.isArray(templates);
+        firstTemplateName = templates[0]?.name || "";
+      }
+    } catch {}
+    return response;
+  };
 
   function cookieValue(name) {
     const prefix = `${name}=`;
@@ -29,6 +49,71 @@
     return element.innerHTML.includes("M12 0C5.37 0 0 5.37");
   }
 
+  function hasChevron(button) {
+    return !!button.querySelector('svg path[d="m6 9 6 6 6-6"]');
+  }
+
+  function templateTrigger() {
+    return [...document.querySelectorAll("button")].find(
+      (button) => button.querySelector(".lucide-file-code") && hasChevron(button) && button.className.includes("max-w-[40%]"),
+    );
+  }
+
+  function enforceViewerTemplate() {
+    const trigger = templateTrigger();
+    if (!trigger) return;
+    if (templatesLoaded && !firstTemplateName) {
+      trigger.disabled = true;
+      trigger.setAttribute("aria-disabled", "true");
+      return;
+    }
+    if (firstTemplateName && trigger.textContent.includes(firstTemplateName)) {
+      trigger.disabled = true;
+      trigger.setAttribute("aria-disabled", "true");
+      templateSelectionBusy = false;
+      return;
+    }
+    trigger.disabled = false;
+    trigger.removeAttribute("aria-disabled");
+    if (!firstTemplateName || templateSelectionBusy) return;
+    templateSelectionBusy = true;
+    trigger.click();
+    window.setTimeout(() => {
+      const option = [...document.querySelectorAll("button")].find(
+        (button) => button.querySelector(".font-medium")?.textContent?.trim() === firstTemplateName,
+      );
+      if (option) option.click();
+      window.setTimeout(() => {
+        templateSelectionBusy = false;
+        applyRole();
+      }, 80);
+    }, 80);
+  }
+
+  function modeTrigger() {
+    return [...document.querySelectorAll("button")].find(
+      (button) => hasChevron(button) && (button.querySelector(".lucide-message-square-plus") || button.querySelector(".lucide-bot")),
+    );
+  }
+
+  function enforceViewerAgentMode() {
+    document.querySelectorAll("button .lucide-message-square-plus").forEach((icon) => {
+      const button = icon.closest("button");
+      if (button && !hasChevron(button)) button.setAttribute(hiddenAttribute, "true");
+    });
+    const trigger = modeTrigger();
+    if (!trigger || trigger.querySelector(".lucide-bot") || agentSelectionBusy) return;
+    agentSelectionBusy = true;
+    trigger.click();
+    window.setTimeout(() => {
+      const agentButton = [...document.querySelectorAll("button")].find(
+        (button) => button.querySelector(".lucide-bot") && !hasChevron(button) && /Agent|代理|智能体/i.test(button.textContent || ""),
+      );
+      if (agentButton) agentButton.click();
+      agentSelectionBusy = false;
+    }, 80);
+  }
+
   function applyRole() {
     const isViewer = viewer();
     document.documentElement.classList.toggle("dbx-guard-viewer", isViewer);
@@ -41,7 +126,18 @@
     document.querySelectorAll("button,a,[role='menuitem']").forEach((element) => {
       if (isForbiddenControl(element)) element.setAttribute(hiddenAttribute, "true");
     });
+    enforceViewerTemplate();
+    enforceViewerAgentMode();
   }
+
+  document.addEventListener("click", (event) => {
+    if (!viewer()) return;
+    const button = event.target.closest?.("button");
+    if (button?.querySelector(".lucide-message-square-plus") && !hasChevron(button)) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+  }, true);
 
   document.addEventListener("keydown", (event) => {
     if (!viewer()) return;

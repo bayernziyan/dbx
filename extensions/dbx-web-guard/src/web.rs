@@ -379,7 +379,30 @@ async fn proxy_request(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let (parts, body) = request.into_parts();
-    let body = to_bytes(body, state.config.max_body_bytes()).await.context("read proxied request body")?;
+    let mut body = to_bytes(body, state.config.max_body_bytes()).await.context("read proxied request body")?;
+    let viewer = session.role == Role::Viewer;
+    if viewer && parts.method == Method::POST && parts.uri.path() == state.config.public_path("/api/ai/agent-stream") {
+        let template = match load_first_prompt_template(&state, &session.upstream_cookie).await {
+            Ok(template) => template,
+            Err(_) => {
+                return Ok(json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "WEB_GUARD_TEMPLATE_UNAVAILABLE",
+                    "The required prompt template is unavailable.",
+                ));
+            }
+        };
+        body = match force_agent_mode(&body, template.as_ref()) {
+            Ok(body) => body,
+            Err(_) => {
+                return Ok(json_error(
+                    StatusCode::BAD_REQUEST,
+                    "WEB_GUARD_AI_REQUEST_INVALID",
+                    "Invalid AI Agent request.",
+                ));
+            }
+        };
+    }
     let mut upstream =
         send_upstream(&state, &parts.method, &parts.uri, &parts.headers, &session.upstream_cookie, body.clone())
             .await?;
@@ -390,7 +413,72 @@ async fn proxy_request(
         upstream =
             send_upstream(&state, &parts.method, &parts.uri, &parts.headers, &session.upstream_cookie, body).await?;
     }
+    if viewer && parts.method == Method::GET && parts.uri.path() == state.config.public_path("/api/prompt-templates") {
+        return first_prompt_template_response(upstream).await;
+    }
     upstream_response(upstream)
+}
+
+fn force_agent_mode(body: &[u8], template: Option<&serde_json::Value>) -> Result<Bytes> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).context("parse AI Agent request")?;
+    let object = value.as_object_mut().context("AI Agent request must be a JSON object")?;
+    object.insert("mode".to_string(), serde_json::Value::String("agent".to_string()));
+    if let Some(request) = object.get_mut("request").and_then(serde_json::Value::as_object_mut) {
+        if let Some(contract) = request.get_mut("taskContract").and_then(serde_json::Value::as_object_mut) {
+            contract.insert("mode".to_string(), serde_json::Value::String("agent".to_string()));
+        }
+        if let Some(template) = template {
+            let name = template.get("name").and_then(serde_json::Value::as_str).unwrap_or("Default");
+            let content = template.get("content").and_then(serde_json::Value::as_str).unwrap_or("").trim();
+            if !content.is_empty() {
+                let block = format!("### {name}\n{content}");
+                let prompt = request.entry("systemPrompt").or_insert_with(|| serde_json::Value::String(String::new()));
+                let prompt = prompt.as_str().context("request.systemPrompt must be a string")?.to_string();
+                if !prompt.contains(&block) {
+                    request.insert(
+                        "systemPrompt".to_string(),
+                        serde_json::Value::String(format!("{prompt}\n\n## Guard-enforced viewer template\n{block}")),
+                    );
+                }
+            }
+        }
+    }
+    Ok(Bytes::from(serde_json::to_vec(&value).context("serialize AI Agent request")?))
+}
+
+async fn load_first_prompt_template(state: &AppState, upstream_cookie: &str) -> Result<Option<serde_json::Value>> {
+    let url = state.config.upstream_url(&state.config.public_path("/api/prompt-templates"));
+    let response =
+        state.client.get(url).header(COOKIE, upstream_cookie).send().await.context("load prompt templates")?;
+    if !response.status().is_success() {
+        bail!("prompt template request failed with status {}", response.status());
+    }
+    let templates: Vec<serde_json::Value> = response.json().await.context("parse prompt templates")?;
+    Ok(templates.into_iter().next())
+}
+
+async fn first_prompt_template_response(upstream: reqwest::Response) -> Result<Response<Body>> {
+    if !upstream.status().is_success() {
+        return upstream_response(upstream);
+    }
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let bytes = upstream.bytes().await.context("read prompt templates response")?;
+    let body = first_prompt_template_body(&bytes)?;
+    let mut builder = Response::builder().status(status);
+    for (name, value) in &headers {
+        if forward_transformed_response_header(name) {
+            builder = builder.header(name, value);
+        }
+    }
+    Ok(builder.header(CONTENT_TYPE, "application/json").body(Body::from(body))?)
+}
+
+fn first_prompt_template_body(body: &[u8]) -> Result<Vec<u8>> {
+    let mut templates: Vec<serde_json::Value> =
+        serde_json::from_slice(body).context("parse prompt templates response")?;
+    templates.truncate(1);
+    serde_json::to_vec(&templates).context("serialize filtered prompt templates")
 }
 
 async fn send_upstream(
@@ -576,6 +664,7 @@ fn forward_request_header(name: &HeaderName) -> bool {
             | "x-forwarded-host"
             | "x-forwarded-proto"
             | "x-dbx-guard-role"
+            | "accept-encoding"
     )
 }
 
@@ -584,6 +673,11 @@ fn forward_response_header(name: &HeaderName) -> bool {
         name.as_str().to_ascii_lowercase().as_str(),
         "set-cookie" | "connection" | "keep-alive" | "transfer-encoding" | "upgrade"
     )
+}
+
+fn forward_transformed_response_header(name: &HeaderName) -> bool {
+    forward_response_header(name)
+        && !matches!(name.as_str().to_ascii_lowercase().as_str(), "content-length" | "content-encoding")
 }
 
 fn forward_websocket_response_header(name: &HeaderName) -> bool {
@@ -661,10 +755,12 @@ mod tests {
     use axum::extract::State;
     use axum::http::{HeaderMap, HeaderValue, Method};
     use axum::response::Response;
-    use axum::routing::{any, post};
+    use axum::routing::{any, get, post};
     use axum::{Json, Router};
 
-    use super::{cookie_value, inject_html, origin_allowed, router, AppState};
+    use super::{
+        cookie_value, first_prompt_template_body, force_agent_mode, inject_html, origin_allowed, router, AppState,
+    };
     use crate::config::{
         GuardConfig, PolicyConfig, PolicyRuleConfig, SecurityConfig, ServerConfig, SessionConfig, StaticConfig,
         StorageConfig, UpstreamConfig,
@@ -711,6 +807,10 @@ mod tests {
                     Json(serde_json::json!({"cookie": headers.get("cookie").and_then(|value| value.to_str().ok())}))
                 }),
             )
+            .route(
+                "/dbx/api/prompt-templates",
+                get(|| async { Json(serde_json::json!([{"id":"first","name":"First","content":"Use Wiki first."}])) }),
+            )
             .route("/dbx/api/update/check", any(|| async { "admin-upstream" }))
             .with_state(counter);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -756,6 +856,39 @@ mod tests {
         headers.insert("origin", HeaderValue::from_static("http://evil"));
         assert!(!origin_allowed(&config, &headers, &Method::POST));
         assert!(origin_allowed(&config, &headers, &Method::GET));
+    }
+
+    #[test]
+    fn viewer_agent_request_is_forced_to_agent_mode() {
+        for original in ["ask", "agent"] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "mode":original,
+                "instruction":"query",
+                "request":{"systemPrompt":"base","taskContract":{"mode":original}}
+            }))
+            .unwrap();
+            let template = serde_json::json!({"name":"First","content":"Always use the Wiki first."});
+            let forced: serde_json::Value =
+                serde_json::from_slice(&force_agent_mode(&body, Some(&template)).unwrap()).unwrap();
+            assert_eq!(forced["mode"], "agent");
+            assert_eq!(forced["instruction"], "query");
+            assert_eq!(forced["request"]["taskContract"]["mode"], "agent");
+            assert!(forced["request"]["systemPrompt"].as_str().unwrap().contains("### First"));
+        }
+        assert!(force_agent_mode(b"[]", None).is_err());
+    }
+
+    #[test]
+    fn viewer_prompt_template_response_keeps_only_first_item() {
+        let input = serde_json::to_vec(&serde_json::json!([
+            {"id":"first","name":"First"},
+            {"id":"second","name":"Second"}
+        ]))
+        .unwrap();
+        let output: Vec<serde_json::Value> =
+            serde_json::from_slice(&first_prompt_template_body(&input).unwrap()).unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["id"], "first");
     }
 
     #[tokio::test]
@@ -814,6 +947,10 @@ mod tests {
             .post(format!("http://{address}/dbx/api/ai/agent-stream"))
             .header("origin", "http://server:82")
             .header("cookie", format!("{viewer_cookie}; dbx_guard_ui=admin"))
+            .json(&serde_json::json!({
+                "mode":"ask",
+                "request":{"systemPrompt":"base","taskContract":{"mode":"ask"}}
+            }))
             .send()
             .await
             .unwrap();
