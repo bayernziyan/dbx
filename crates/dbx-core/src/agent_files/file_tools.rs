@@ -10,7 +10,7 @@ use crate::agent_events::{ToolCall, ToolDefinition, ToolResult};
 
 use super::audit::FileWriteAudit;
 use super::directory_scope::{canonicalize_scope_root, FileDirectoryScope};
-use super::document::{parse_document, DEFAULT_PARSE_LIMIT};
+use super::document::{decode_text, parse_document, DEFAULT_PARSE_LIMIT};
 use super::file_support::{
     collect_entries, collect_files, is_searchable_text, normalize_path, optional_str, relative_to_root,
     require_db_wiki_policy, required_raw_str, required_str, tool_result, truncate_chars, MAX_LIST_RESULTS,
@@ -118,7 +118,15 @@ impl AgentFileService {
     }
 
     async fn scope(&self, arguments: &Value) -> Result<FileDirectoryScope, String> {
-        let scope_id = required_str(arguments, "scope_id")?;
+        let scope_id = arguments
+            .get("scope_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "FILE_SCOPE_REQUIRED: call dbx_file_open_scope with the explicit user-provided directory path, then retry this file tool with the returned scopeId"
+                    .to_string()
+            })?;
         self.scopes
             .read()
             .await
@@ -170,9 +178,9 @@ impl AgentFileService {
             if !is_searchable_text(extension) {
                 continue;
             }
-            let text = match std::fs::read_to_string(&path) {
-                Ok(text) => text,
-                Err(_) => continue,
+            let text = match std::fs::read(&path).ok().and_then(|bytes| decode_text(&bytes).ok()) {
+                Some(decoded) => decoded.text,
+                None => continue,
             };
             for (index, line) in text.lines().enumerate() {
                 let matched = regex.as_ref().map_or_else(|| line.contains(query), |pattern| pattern.is_match(line));
@@ -204,10 +212,11 @@ impl AgentFileService {
         if metadata.len() > MAX_TEXT_FILE_BYTES {
             return Err("FILE_TOO_LARGE: text reads are limited to 2 MiB; use parse for structured files".to_string());
         }
-        let bytes = std::fs::read(&path).map_err(|error| format!("FILE_READ_FAILED: {}: {error}", path.display()))?;
-        let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
-        let text =
-            std::str::from_utf8(bytes).map_err(|_| "FILE_ENCODING_UNSUPPORTED: use dbx_file_parse".to_string())?;
+        let raw_bytes =
+            std::fs::read(&path).map_err(|error| format!("FILE_READ_FAILED: {}: {error}", path.display()))?;
+        let decoded = decode_text(&raw_bytes)?;
+        let hash_bytes = raw_bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&raw_bytes);
+        let text = decoded.text;
         let start = arguments.get("start_line").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
         let max_lines = arguments.get("max_lines").and_then(Value::as_u64).unwrap_or(200).clamp(1, 500) as usize;
         let total_lines = text.lines().count();
@@ -222,7 +231,8 @@ impl AgentFileService {
         Ok(json!({
             "scopeId": scope.id,
             "path": normalize_path(Path::new(relative)),
-            "contentHash": bytes_sha256(bytes),
+            "contentHash": bytes_sha256(hash_bytes),
+            "encoding": decoded.encoding,
             "lines": lines,
             "lineCount": total_lines,
             "truncated": next_line <= total_lines,

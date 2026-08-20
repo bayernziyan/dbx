@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use futures::future::join_all;
 use futures::FutureExt;
+use regex::Regex;
 use serde_json::json;
 use tokio::sync::Notify;
 
@@ -34,6 +35,7 @@ const TOOL_RESULT_HEAD_CHARS: usize = 4_000;
 const TOOL_RESULT_TAIL_CHARS: usize = 4_000;
 const TOOL_RESULT_SAMPLE_ITEMS: usize = 5;
 const MAX_CONTRACT_REPAIR_ATTEMPTS: u32 = 2;
+const MAX_WIKI_EVIDENCE_REPAIR_ATTEMPTS: u32 = 1;
 
 fn agent_file_tools_enabled() -> bool {
     !std::env::var("DBX_AGENT_FILE_TOOLS")
@@ -53,6 +55,46 @@ fn extension_definitions_for_mode(
     registry.definitions().into_iter().filter(|definition| is_agent_mode || definition.read_only).collect()
 }
 
+fn explicit_db_wiki_path_available(system_prompt: &str, messages: &[AiMessage]) -> bool {
+    static ABSOLUTE_DB_WIKI_PATH: OnceLock<Regex> = OnceLock::new();
+    let pattern = ABSOLUTE_DB_WIKI_PATH.get_or_init(|| {
+        Regex::new(r#"(?i)(?:[a-z]:[\\/]|\\\\|/)[^\r\n\"'<>]*\bdb-wiki\b"#)
+            .expect("absolute db-wiki path regex must compile")
+    });
+    pattern.is_match(system_prompt)
+        || messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .is_some_and(|message| pattern.is_match(&message.content))
+}
+
+fn is_database_evidence_tool(name: &str) -> bool {
+    matches!(name, "list_tables" | "get_columns" | "execute_query" | "get_sample_data" | "explain_query")
+}
+
+fn is_successful_wiki_evidence(tool_name: &str, result: &ToolResult) -> bool {
+    !result.is_error && matches!(tool_name, "dbx_wiki_search" | "dbx_wiki_build_evidence")
+}
+
+fn wiki_evidence_required_result(call: &ToolCall) -> ToolResult {
+    ToolResult {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        content: "Error: WIKI_EVIDENCE_REQUIRED: an explicit DB-Wiki directory is available; call dbx_file_open_scope first, then dbx_wiki_search or dbx_wiki_build_evidence before using database schema or query tools"
+            .to_string(),
+        is_error: true,
+        explain_data: None,
+    }
+}
+
+fn build_wiki_evidence_repair_prompt() -> String {
+    "[SYSTEM-GENERATED DB-WIKI EVIDENCE CHECK]\n\
+An explicit DB-Wiki directory is available, but no successful Wiki evidence tool call has completed for this request.\n\
+Call dbx_file_open_scope with that exact directory, then call dbx_wiki_search or dbx_wiki_build_evidence. Do not call list_tables, get_columns, execute_query, get_sample_data, explain_query, or information_schema until Wiki evidence succeeds. If the Wiki has no matching mapping, that successful no-match result permits the database fallback."
+        .to_string()
+}
+
 fn augment_system_prompt_with_file_tools(system_prompt: &str, is_agent_mode: bool) -> String {
     let write_rule = if is_agent_mode {
         "File writes are available only inside the opened allowlisted scope and must use the supplied hash guards."
@@ -63,6 +105,7 @@ fn augment_system_prompt_with_file_tools(system_prompt: &str, is_agent_mode: boo
         "{system_prompt}\n\n[DBX FILE EVIDENCE TOOLS]\n\
 Read-only file evidence tools are available in this run. When the user supplies an absolute directory path, call dbx_file_open_scope first, then use dbx_file_list/dbx_file_search/dbx_file_read/dbx_file_parse as needed. For a directory whose final name is db-wiki, prefer dbx_wiki_search/dbx_wiki_build_evidence. Do not claim that local files are inaccessible before attempting these tools. If no absolute path is present in the conversation, ask for it instead of inventing one. Any canonical directory may be read, but write access is granted only when a registered write allowlist policy matches.\n\
 Treat dbx_file_open_scope as the first file tool of every new user request that needs files, even if an earlier conversation turn opened the same directory; opening the same path again is safe. Never invent or reuse a scopeId from assistant text. If a file tool returns FILE_SCOPE_NOT_FOUND, immediately call dbx_file_open_scope again using the exact absolute directory path supplied in the current user request or selected Prompt template, then retry the failed file action once with the new scopeId. Do not continue the task or report the first failure as final. If no such path is available, ask the user for it. Do not call dbx_file_close_scope after completing a task unless the user explicitly asks to close it or the root must be abandoned.\n\
+When an explicit DB-Wiki directory is available, obtain Wiki evidence before database schema or query tools: dbx_file_open_scope -> dbx_wiki_search/dbx_wiki_build_evidence -> list_tables/get_columns -> a narrow read-only query when the current mode permits it. Never call a dependent file tool without scopeId. An information_schema query is schema diagnosis only and never completes a business question about a concrete record or workflow instance ID.\n\
 {write_rule}"
     )
 }
@@ -276,6 +319,7 @@ pub async fn run_agent_loop(
     }
     let function_extensions = shared_agent_function_registry();
     let file_tools_enabled = agent_file_tools_enabled();
+    let wiki_evidence_required = file_tools_enabled && explicit_db_wiki_path_available(system_prompt, messages);
     let file_tools_system_prompt = if file_tools_enabled {
         augment_system_prompt_with_file_tools(system_prompt, is_agent_mode)
     } else {
@@ -296,6 +340,8 @@ pub async fn run_agent_loop(
     let mut loop_exit = LoopExit::Exhausted;
     let mut total_usage = TokenUsage::default();
     let mut contract_repair_attempts = 0;
+    let mut wiki_evidence_repair_attempts = 0;
+    let mut wiki_evidence_ready = false;
 
     let max_agent_turns = clamp_max_agent_turns(agent_ctx.max_agent_turns);
 
@@ -469,6 +515,24 @@ pub async fn run_agent_loop(
                 .collect(),
         });
 
+        if collected_tool_calls.is_empty() && wiki_evidence_required && !wiki_evidence_ready {
+            if wiki_evidence_repair_attempts < MAX_WIKI_EVIDENCE_REPAIR_ATTEMPTS {
+                wiki_evidence_repair_attempts += 1;
+                conversation_messages.push(AiMessage {
+                    role: "user".to_string(),
+                    content: build_wiki_evidence_repair_prompt(),
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                });
+                continue;
+            }
+            let message = "Unable to complete the request because the required DB-Wiki evidence step was skipped. Reopen the explicit Wiki scope and retry.".to_string();
+            on_event(AgentEvent::TextDelta { delta: message.clone() });
+            final_text = message;
+            loop_exit = LoopExit::Completed;
+            break;
+        }
+
         if collected_tool_calls.is_empty() {
             match validate_final_answer(task_contract.as_ref(), &accumulated_text) {
                 FinalAnswerCheck::Satisfied => {
@@ -522,6 +586,7 @@ pub async fn run_agent_loop(
         let db_type = agent_ctx.db_type;
         let sql_permissions = agent_ctx.sql_permissions.clone();
         let function_extensions2 = Arc::clone(&function_extensions);
+        let database_tools_blocked = wiki_evidence_required && !wiki_evidence_ready;
 
         // Split by index into parallel and sequential groups using tool metadata
         let tool_parallel_map: std::collections::HashMap<&str, bool> =
@@ -548,7 +613,9 @@ pub async fn run_agent_loop(
                 let perms = sql_permissions.clone();
                 let extensions = Arc::clone(&function_extensions2);
                 async move {
-                    if extensions.handles(&tc.name) {
+                    if database_tools_blocked && is_database_evidence_tool(&tc.name) {
+                        wiki_evidence_required_result(&tc)
+                    } else if extensions.handles(&tc.name) {
                         extensions.execute(&tc).await.expect("handled extension tool must execute")
                     } else {
                         agent_tools::execute_tool(&tc, &state, &conn, &db, schema.as_deref(), &db_type, perms).await
@@ -562,7 +629,9 @@ pub async fn run_agent_loop(
         let mut sequential_results = Vec::with_capacity(sequential_indices.len());
         for &i in &sequential_indices {
             let tc = make_tc(&collected_tool_calls[i]);
-            sequential_results.push(if function_extensions2.handles(&tc.name) {
+            sequential_results.push(if database_tools_blocked && is_database_evidence_tool(&tc.name) {
+                wiki_evidence_required_result(&tc)
+            } else if function_extensions2.handles(&tc.name) {
                 function_extensions2.execute(&tc).await.expect("handled extension tool must execute")
             } else {
                 agent_tools::execute_tool(
@@ -590,6 +659,9 @@ pub async fn run_agent_loop(
 
         // Process results in order, emitting ToolCallEnd events
         for (tc, result) in collected_tool_calls.iter().zip(results) {
+            if is_successful_wiki_evidence(&tc.name, &result) {
+                wiki_evidence_ready = true;
+            }
             on_event(AgentEvent::ToolCallEnd {
                 tool_call_id: tc.id.clone(),
                 tool_name: tc.name.clone(),
@@ -1221,7 +1293,7 @@ async fn maybe_compact(
 
 fn tool_result_for_followup_context(tool_name: &str, content: &str) -> String {
     let result = compact_tool_result_for_context(tool_name, content);
-    let scope_recovery = content.contains("FILE_SCOPE_NOT_FOUND").then_some(
+    let scope_recovery = (content.contains("FILE_SCOPE_NOT_FOUND") || content.contains("FILE_SCOPE_REQUIRED")).then_some(
         "\n\n[MANDATORY FILE-SCOPE RECOVERY]\nThe scope ID is no longer valid. Before any other work, call dbx_file_open_scope with the exact absolute directory path from the current user request or selected Prompt template. Use the returned scopeId to retry the failed action once. Never reuse the failed scopeId. If the path is unavailable, ask the user for it.",
     );
     format!(
@@ -1475,7 +1547,61 @@ mod tests {
             assert!(prompt.contains("Never invent or reuse a scopeId"));
             assert!(prompt.contains("FILE_SCOPE_NOT_FOUND"));
             assert!(prompt.contains("retry the failed file action once"));
+            assert!(prompt.contains("obtain Wiki evidence before database schema or query tools"));
+            assert!(prompt.contains("information_schema query is schema diagnosis only"));
         }
+    }
+
+    #[test]
+    fn detects_explicit_db_wiki_path_only_in_current_request_or_template() {
+        let request = AiMessage {
+            role: "user".to_string(),
+            content: r#"数据库 Wiki 目录：E:\workspace\demo\.memory\db-wiki"#.to_string(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        };
+        assert!(explicit_db_wiki_path_available("base", std::slice::from_ref(&request)));
+        assert!(explicit_db_wiki_path_available(r#"Use /srv/project/.memory/db-wiki for evidence."#, &[]));
+
+        let plain_request = AiMessage { content: "查询流程实例发起人".to_string(), ..request };
+        assert!(!explicit_db_wiki_path_available("db-wiki is a directory policy name", &[plain_request]));
+    }
+
+    #[test]
+    fn wiki_first_gate_blocks_database_tools_but_allows_file_evidence_tools() {
+        for name in ["list_tables", "get_columns", "execute_query", "get_sample_data", "explain_query"] {
+            assert!(is_database_evidence_tool(name), "{name}");
+        }
+        for name in ["dbx_file_open_scope", "dbx_wiki_search", "dbx_file_read", "get_current_time"] {
+            assert!(!is_database_evidence_tool(name), "{name}");
+        }
+
+        let call = ToolCall {
+            id: "list-tables-id".to_string(),
+            name: "list_tables".to_string(),
+            arguments: json!({}),
+            provider_payload: None,
+        };
+        let blocked = wiki_evidence_required_result(&call);
+        assert!(blocked.is_error);
+        assert!(blocked.content.contains("WIKI_EVIDENCE_REQUIRED"));
+        assert!(blocked.content.contains("dbx_file_open_scope"));
+    }
+
+    #[test]
+    fn only_successful_wiki_semantic_tools_satisfy_evidence_gate() {
+        let success = ToolResult {
+            tool_call_id: "wiki-id".to_string(),
+            tool_name: "dbx_wiki_search".to_string(),
+            content: r#"{"matches":[]}"#.to_string(),
+            is_error: false,
+            explain_data: None,
+        };
+        assert!(is_successful_wiki_evidence("dbx_wiki_search", &success));
+        assert!(!is_successful_wiki_evidence("dbx_file_open_scope", &success));
+
+        let failed = ToolResult { is_error: true, ..success };
+        assert!(!is_successful_wiki_evidence("dbx_wiki_search", &failed));
     }
 
     #[test]
@@ -1592,6 +1718,12 @@ mod tests {
         assert!(wrapped.contains("dbx_file_open_scope"));
         assert!(wrapped.contains("retry the failed action once"));
         assert!(wrapped.contains("Never reuse the failed scopeId"));
+
+        let missing = tool_result_for_followup_context(
+            "dbx_file_search",
+            "Error: FILE_SCOPE_REQUIRED: call dbx_file_open_scope first",
+        );
+        assert!(missing.contains("MANDATORY FILE-SCOPE RECOVERY"));
     }
 
     // --- chunk_to_events tests ---

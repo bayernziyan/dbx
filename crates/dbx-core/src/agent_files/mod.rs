@@ -158,6 +158,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dependent_file_tool_without_scope_returns_recoverable_scope_required_error() {
+        let service = AgentFileService::default();
+        let result = service.execute(&call("dbx_file_search", json!({ "query": "workflow" }))).await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("FILE_SCOPE_REQUIRED"));
+        assert!(result.content.contains("dbx_file_open_scope"));
+    }
+
+    #[tokio::test]
     async fn empty_db_wiki_directory_is_allowlisted_by_leaf_name() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("db-wiki");
@@ -221,6 +231,34 @@ mod tests {
             .await;
         assert!(stale.is_error);
         assert!(stale.content.contains("FILE_HASH_CONFLICT"));
+    }
+
+    #[tokio::test]
+    async fn gbk_text_is_read_searchable_and_parseable_without_utf8_fallback_error() {
+        let (_temp, root) = db_wiki();
+        std::fs::create_dir(root.join("tables")).unwrap();
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode("# 流程实例\n发起人字段: request_user_id\n");
+        assert!(!had_errors);
+        std::fs::write(root.join("tables/instance.md"), encoded.as_ref()).unwrap();
+        let service = AgentFileService::default();
+        let opened = service.execute(&call("dbx_file_open_scope", json!({ "path": root.to_string_lossy() }))).await;
+        let scope_id = parsed(&opened)["scopeId"].as_str().unwrap().to_string();
+
+        let read = service
+            .execute(&call("dbx_file_read", json!({ "scope_id": scope_id, "path": "tables/instance.md" })))
+            .await;
+        let read_json = parsed(&read);
+        assert_eq!(read_json["encoding"], "gbk");
+        assert_eq!(read_json["lines"][1]["text"], "发起人字段: request_user_id");
+
+        let search =
+            service.execute(&call("dbx_file_search", json!({ "scope_id": scope_id, "query": "发起人" }))).await;
+        assert_eq!(parsed(&search)["matches"][0]["path"], "tables/instance.md");
+
+        let parsed_document = service
+            .execute(&call("dbx_file_parse", json!({ "scope_id": scope_id, "path": "tables/instance.md" })))
+            .await;
+        assert_eq!(parsed(&parsed_document)["document"]["lines"][1], "发起人字段: request_user_id");
     }
 
     #[tokio::test]
