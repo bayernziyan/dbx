@@ -96,10 +96,19 @@
     );
   }
 
+  function isAskModeButton(button) {
+    if (!button?.querySelector(".lucide-message-square-plus") || hasChevron(button)) return false;
+    const container = button.parentElement;
+    if (!container) return false;
+    return [...container.children].some(
+      (sibling) => sibling !== button && sibling.matches?.("button") && sibling.querySelector(".lucide-bot"),
+    );
+  }
+
   function enforceViewerAgentMode() {
     document.querySelectorAll("button .lucide-message-square-plus").forEach((icon) => {
       const button = icon.closest("button");
-      if (button && !hasChevron(button)) button.setAttribute(hiddenAttribute, "true");
+      if (isAskModeButton(button)) button.setAttribute(hiddenAttribute, "true");
     });
     const trigger = modeTrigger();
     if (!trigger || trigger.querySelector(".lucide-bot") || agentSelectionBusy) return;
@@ -133,7 +142,7 @@
   document.addEventListener("click", (event) => {
     if (!viewer()) return;
     const button = event.target.closest?.("button");
-    if (button?.querySelector(".lucide-message-square-plus") && !hasChevron(button)) {
+    if (isAskModeButton(button)) {
       event.preventDefault();
       event.stopImmediatePropagation();
     }

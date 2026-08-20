@@ -45,11 +45,6 @@ path = "/dbx/api/cloud-sync/"
 methods = ["*"]
 
 [[policy.viewer_deny]]
-path = "/dbx/api/connection/save"
-exact = true
-methods = ["*"]
-
-[[policy.viewer_deny]]
 path = "/dbx/api/connection/mcp/"
 methods = ["*"]
 
@@ -110,6 +105,10 @@ methods = ["*"]
 
 [[policy.viewer_allow]]
 path = "/dbx/api/connection/"
+methods = ["GET", "POST"]
+
+[[policy.viewer_allow]]
+path = "/dbx/api/ssh/"
 methods = ["GET", "POST"]
 
 [[policy.viewer_allow]]

@@ -381,6 +381,25 @@ async fn proxy_request(
     let (parts, body) = request.into_parts();
     let mut body = to_bytes(body, state.config.max_body_bytes()).await.context("read proxied request body")?;
     let viewer = session.role == Role::Viewer;
+    if viewer && parts.method == Method::POST && parts.uri.path() == state.config.public_path("/api/connection/save") {
+        body = match viewer_add_connection_body(&state, &session.upstream_cookie, &body).await {
+            Ok(body) => body,
+            Err(_) => {
+                return Ok(json_error(
+                    StatusCode::FORBIDDEN,
+                    "WEB_GUARD_CONNECTION_ADD_ONLY",
+                    "Viewer sessions may add connections but cannot modify or remove existing connections.",
+                ));
+            }
+        };
+    }
+    if viewer && is_query_execution_path(&state.config, parts.uri.path()) && contains_destructive_sql(&body) {
+        return Ok(json_error(
+            StatusCode::FORBIDDEN,
+            "WEB_GUARD_DESTRUCTIVE_SQL_FORBIDDEN",
+            "Viewer sessions cannot drop or truncate database objects.",
+        ));
+    }
     if viewer && parts.method == Method::POST && parts.uri.path() == state.config.public_path("/api/ai/agent-stream") {
         let template = match load_first_prompt_template(&state, &session.upstream_cookie).await {
             Ok(template) => template,
@@ -423,6 +442,11 @@ fn force_agent_mode(body: &[u8], template: Option<&serde_json::Value>) -> Result
     let mut value: serde_json::Value = serde_json::from_slice(body).context("parse AI Agent request")?;
     let object = value.as_object_mut().context("AI Agent request must be a JSON object")?;
     object.insert("mode".to_string(), serde_json::Value::String("agent".to_string()));
+    object.insert("allowWriteSql".to_string(), serde_json::Value::Bool(false));
+    object.insert("confirmedWriteSql".to_string(), serde_json::Value::Null);
+    object.insert("confirmedConnectionId".to_string(), serde_json::Value::Null);
+    object.insert("confirmedDatabase".to_string(), serde_json::Value::Null);
+    object.insert("confirmedSchema".to_string(), serde_json::Value::Null);
     if let Some(request) = object.get_mut("request").and_then(serde_json::Value::as_object_mut) {
         if let Some(contract) = request.get_mut("taskContract").and_then(serde_json::Value::as_object_mut) {
             contract.insert("mode".to_string(), serde_json::Value::String("agent".to_string()));
@@ -444,6 +468,143 @@ fn force_agent_mode(body: &[u8], template: Option<&serde_json::Value>) -> Result
         }
     }
     Ok(Bytes::from(serde_json::to_vec(&value).context("serialize AI Agent request")?))
+}
+
+async fn viewer_add_connection_body(state: &AppState, upstream_cookie: &str, body: &[u8]) -> Result<Bytes> {
+    let url = state.config.upstream_url(&state.config.public_path("/api/connection/list"));
+    let response =
+        state.client.get(url).header(COOKIE, upstream_cookie).send().await.context("load saved connections")?;
+    if !response.status().is_success() {
+        bail!("load saved connections failed with status {}", response.status());
+    }
+    let existing: Vec<serde_json::Value> = response.json().await.context("parse saved connections")?;
+    merge_additive_connections(&existing, body)
+}
+
+fn merge_additive_connections(existing: &[serde_json::Value], body: &[u8]) -> Result<Bytes> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).context("parse save connections request")?;
+    let object = value.as_object_mut().context("save connections request must be a JSON object")?;
+    let incoming = object.get("configs").and_then(serde_json::Value::as_array).context("configs must be an array")?;
+    let existing_ids: std::collections::HashSet<&str> =
+        existing.iter().filter_map(|config| config.get("id").and_then(serde_json::Value::as_str)).collect();
+    let mut new_ids = std::collections::HashSet::new();
+    let mut additions = Vec::new();
+    for config in incoming {
+        let id = config
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .context("connection id is required")?;
+        if existing_ids.contains(id) {
+            continue;
+        }
+        if !new_ids.insert(id.to_string()) {
+            bail!("duplicate new connection id");
+        }
+        additions.push(config.clone());
+    }
+    if additions.is_empty() {
+        bail!("viewer save must add at least one connection");
+    }
+    let mut merged = existing.to_vec();
+    merged.extend(additions);
+    object.insert("configs".to_string(), serde_json::Value::Array(merged));
+    Ok(Bytes::from(serde_json::to_vec(&value).context("serialize additive connection request")?))
+}
+
+fn is_query_execution_path(config: &GuardConfig, path: &str) -> bool {
+    path.starts_with(&config.public_path("/api/query/execute"))
+}
+
+fn contains_destructive_sql(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return true;
+    };
+    contains_destructive_sql_value(&value)
+}
+
+fn contains_destructive_sql_value(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().any(contains_destructive_sql_value),
+        serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+            (key.eq_ignore_ascii_case("sql") && value.as_str().is_some_and(sql_drops_objects))
+                || (key.eq_ignore_ascii_case("statements")
+                    && value.as_array().is_some_and(|statements| {
+                        statements.iter().any(|statement| statement.as_str().is_some_and(sql_drops_objects))
+                    }))
+                || contains_destructive_sql_value(value)
+        }),
+        _ => false,
+    }
+}
+
+fn sql_drops_objects(sql: &str) -> bool {
+    sql_tokens_outside_literals_and_comments(sql).into_iter().any(|token| matches!(token.as_str(), "DROP" | "TRUNCATE"))
+}
+
+fn sql_tokens_outside_literals_and_comments(sql: &str) -> Vec<String> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Normal,
+        SingleQuote,
+        DoubleQuote,
+        Backtick,
+        Bracket,
+        LineComment,
+        BlockComment,
+    }
+    let chars: Vec<char> = sql.chars().collect();
+    let mut normalized = String::with_capacity(sql.len());
+    let mut state = State::Normal;
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        let next = chars.get(index + 1).copied();
+        match state {
+            State::Normal if current == '-' && next == Some('-') => {
+                state = State::LineComment;
+                index += 1;
+                normalized.push(' ');
+            }
+            State::Normal if current == '/' && next == Some('*') => {
+                state = State::BlockComment;
+                index += 1;
+                normalized.push(' ');
+            }
+            State::Normal if current == '\'' => state = State::SingleQuote,
+            State::Normal if current == '"' => state = State::DoubleQuote,
+            State::Normal if current == '`' => state = State::Backtick,
+            State::Normal if current == '[' => state = State::Bracket,
+            State::Normal => normalized.push(if current.is_alphanumeric() || current == '_' {
+                current.to_ascii_uppercase()
+            } else {
+                ' '
+            }),
+            State::LineComment if matches!(current, '\r' | '\n') => {
+                state = State::Normal;
+                normalized.push(' ');
+            }
+            State::BlockComment if current == '*' && next == Some('/') => {
+                state = State::Normal;
+                index += 1;
+                normalized.push(' ');
+            }
+            State::SingleQuote if current == '\'' && next == Some('\'') => index += 1,
+            State::SingleQuote if current == '\'' => state = State::Normal,
+            State::DoubleQuote if current == '"' && next == Some('"') => index += 1,
+            State::DoubleQuote if current == '"' => state = State::Normal,
+            State::Backtick if current == '`' && next == Some('`') => index += 1,
+            State::Backtick if current == '`' => state = State::Normal,
+            State::Bracket if current == ']' && next == Some(']') => index += 1,
+            State::Bracket if current == ']' => state = State::Normal,
+            _ => {}
+        }
+        if state != State::Normal {
+            normalized.push(' ');
+        }
+        index += 1;
+    }
+    normalized.split_whitespace().map(str::to_string).collect()
 }
 
 async fn load_first_prompt_template(state: &AppState, upstream_cookie: &str) -> Result<Option<serde_json::Value>> {
@@ -665,6 +826,7 @@ fn forward_request_header(name: &HeaderName) -> bool {
             | "x-forwarded-proto"
             | "x-dbx-guard-role"
             | "accept-encoding"
+            | "content-length"
     )
 }
 
@@ -759,7 +921,8 @@ mod tests {
     use axum::{Json, Router};
 
     use super::{
-        cookie_value, first_prompt_template_body, force_agent_mode, inject_html, origin_allowed, router, AppState,
+        contains_destructive_sql, cookie_value, first_prompt_template_body, force_agent_mode, inject_html,
+        merge_additive_connections, origin_allowed, router, AppState,
     };
     use crate::config::{
         GuardConfig, PolicyConfig, PolicyRuleConfig, SecurityConfig, ServerConfig, SessionConfig, StaticConfig,
@@ -848,6 +1011,12 @@ mod tests {
     }
 
     #[test]
+    fn rewritten_requests_do_not_forward_stale_content_length() {
+        assert!(!super::forward_request_header(&axum::http::header::CONTENT_LENGTH));
+        assert!(super::forward_request_header(&axum::http::header::CONTENT_TYPE));
+    }
+
+    #[test]
     fn enforces_origin_for_unsafe_browser_requests() {
         let config = config();
         let mut headers = HeaderMap::new();
@@ -871,6 +1040,8 @@ mod tests {
             let forced: serde_json::Value =
                 serde_json::from_slice(&force_agent_mode(&body, Some(&template)).unwrap()).unwrap();
             assert_eq!(forced["mode"], "agent");
+            assert_eq!(forced["allowWriteSql"], false);
+            assert!(forced["confirmedWriteSql"].is_null());
             assert_eq!(forced["instruction"], "query");
             assert_eq!(forced["request"]["taskContract"]["mode"], "agent");
             assert!(forced["request"]["systemPrompt"].as_str().unwrap().contains("### First"));
@@ -889,6 +1060,37 @@ mod tests {
             serde_json::from_slice(&first_prompt_template_body(&input).unwrap()).unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["id"], "first");
+    }
+
+    #[test]
+    fn viewer_connection_save_preserves_existing_and_appends_only_new_items() {
+        let existing = vec![serde_json::json!({"id":"existing","name":"Original","host":"db-old"})];
+        let incoming = serde_json::to_vec(&serde_json::json!({"configs":[
+            {"id":"existing","name":"Tampered","host":"db-new"},
+            {"id":"added","name":"Added","host":"db-added"}
+        ]}))
+        .unwrap();
+        let output: serde_json::Value =
+            serde_json::from_slice(&merge_additive_connections(&existing, &incoming).unwrap()).unwrap();
+        assert_eq!(output["configs"].as_array().unwrap().len(), 2);
+        assert_eq!(output["configs"][0]["name"], "Original");
+        assert_eq!(output["configs"][1]["id"], "added");
+
+        let no_addition = serde_json::to_vec(&serde_json::json!({"configs":[{"id":"existing"}]})).unwrap();
+        assert!(merge_additive_connections(&existing, &no_addition).is_err());
+    }
+
+    #[test]
+    fn viewer_query_guard_blocks_object_deletion_outside_literals_and_comments() {
+        let body = |sql: &str| serde_json::to_vec(&serde_json::json!({"sql":sql})).unwrap();
+        assert!(contains_destructive_sql(&body("DROP TABLE users")));
+        assert!(contains_destructive_sql(&body("truncate table audit_log")));
+        assert!(contains_destructive_sql(&body("ALTER TABLE users DROP COLUMN legacy")));
+        assert!(!contains_destructive_sql(&body("SELECT 'DROP TABLE users'")));
+        assert!(!contains_destructive_sql(&body("-- DROP TABLE users\nSELECT 1")));
+        assert!(!contains_destructive_sql(&body("DELETE FROM users WHERE id = 1")));
+        let batch = serde_json::to_vec(&serde_json::json!({"statements":["SELECT 1","DROP VIEW legacy"]})).unwrap();
+        assert!(contains_destructive_sql(&batch));
     }
 
     #[tokio::test]
